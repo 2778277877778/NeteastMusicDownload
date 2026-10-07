@@ -1,85 +1,71 @@
 # -*- coding: utf-8 -*-
-"""
-「NCM 解码」标签页：把 .ncm 解码/转码为通用音频格式。
+r"""
+「NCM 解码」标签页：把本地 .ncm 解密成可播放的 mp3 / flac。
 
-不重写解码算法，而是驱动已有的 NCMDecoder.exe：
-  * 每个文件一个子进程，Python 侧控制并发 —— 换来精确的单文件状态、可取消、可重试
-  * 子进程的 -c 固定为 1，避免与 Python 的并发池叠加
-  * 结果以 stdout 的 [OK]/[!!] 行为准，退出码兜底，-log 文件提供 WARN 细节
+V2.0 起改为**内置纯 Python 解密**（见 ncm_dump.py，算法照搬 taurusxin/ncmdump，MIT），
+不再驱动外部 NCMDecoder.exe —— 少一个"包里没附带"的依赖，状态、进度、取消也都能
+精确到单个文件。
+
+只解容器，不转码：输出就是封在里面的原始格式（mp3 / flac），
+再用下载页同一套代码写封面与标签，命名也沿用下载页的「命名格式」。
+
+流程上沿用之前验证过的几条约束：
+  * 每个任务写自己的临时子目录，成功后原子移入音乐库 —— 并发时不会抢同一个输出名，
+    中途取消也不会把半成品留在音乐库里
+  * 移入前和同名文件比内容（大小 + 首尾各 1MB），一致就判「已存在」，不堆 (1)(2)
+  * 解码进行中不许改队列：行号是结果回填的依据
 """
 
 import os
 import queue
 import random
-import re
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
 import traceback
-import gui_theme
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import gui_theme
+import ncm_dump
 from gui_common import (
     BUSY_POLL_MS,
-    BITRATE_PRESETS,
     C_BAD,
     C_INFO,
     C_MUTED,
     C_OK,
-    DECODER_ERRORS,
-    FORMAT_PRESETS,
     IDLE_POLL_MS,
-    LOSSLESS_FORMATS,
     append_log,
     enable_drop,
-    find_decoder,
     human_size,
-    log_file,
     log_file_many,
     safe_name,
     same_file,
     split_drop_paths,
+    write_tags,
 )
-
-CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
-
-RE_OK = re.compile(r'\[OK\]\s+(.+?)\s+→\s+(.+?)\s*[\r\n]')
-RE_FAIL = re.compile(r'\[!!\]\s+(.+?)\s+失败\((\d+)\)\s*(.*?)\s*[\r\n]')
-RE_WARN = re.compile(r'\[WARN\]\s*(.+?)\s*[\r\n]')
 
 
 class DecodeTab(ttk.Frame):
-
-    # 1003 = 输出文件写入失败。两个源文件的元数据相同时，并发解码会同时选中
-    # 同一个候选文件名，撞上"文件正由另一进程使用"。属瞬时冲突，退避重试即可。
-    RETRY_CODES = (1003,)
-    RETRY_MAX = 3
 
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
         self.settings = app.settings
         self.files = []            # 绝对路径列表
+        self.sizes = {}            # 路径 → 字节数，避免每行都去 stat
         self.q = queue.Queue()
         self.stop_event = threading.Event()
         self.busy = False
-        self._procs = {}
-        self._lock = threading.Lock()
-        self._name_lock = threading.Lock()   # 保护"移入音乐库"时的重名判重
         self._tmpdir = None
-        self._sizes = {}                     # 入队时缓存文件大小，避免重绘时逐个 stat
+        self._name_lock = threading.Lock()
         self._file_btns = []
-        self._decoder_labels = []            # 所有显示解码器状态的标签
-        self._decoder_status = ('', C_MUTED)
         self._build_ui()
-        self.after(80, self._drain)
 
-    # ------------------------------------------------------------------ UI
+    # ------------------------------------------------------------------ 界面
     def _build_ui(self):
         pad = {'padx': 8, 'pady': 4}
 
@@ -90,40 +76,26 @@ class DecodeTab(ttk.Frame):
                                  ('移除选中', 10, self.remove_selected, 4),
                                  ('清空', 7, self.clear, 0)):
             b = ttk.Button(bar, text=txt, width=w, command=cmd)
-            b.pack(side='left', padx=gap)      # 注意别用 pad 当循环变量，上面那个 pad 是 pack 参数字典
+            b.pack(side='left', padx=gap)
             self._file_btns.append(b)
         self.lbl_drop = ttk.Label(bar, text='（可直接把 .ncm 文件或文件夹拖进下方列表）',
                                   foreground=C_MUTED)
         self.lbl_drop.pack(side='left', padx=12)
 
-        # ---- 参数 ----
         opt = ttk.LabelFrame(self, text=' 解码参数 ')
         opt.pack(fill='x', **pad)
 
         r1 = ttk.Frame(opt)
         r1.pack(fill='x', padx=8, pady=6)
-        ttk.Label(r1, text='输出格式:').pack(side='left')
-        self.var_format = tk.StringVar()
-        cb = ttk.Combobox(r1, textvariable=self.var_format, width=20,
-                          values=[n for n, _ in FORMAT_PRESETS])
-        cb.pack(side='left', padx=(4, 2))
-        cb.bind('<<ComboboxSelected>>', lambda e: self._sync_bitrate_state())
-        cb.bind('<KeyRelease>', lambda e: self._sync_bitrate_state())
-        ttk.Label(r1, text='（可直接输入扩展名）', foreground=C_MUTED).pack(side='left')
-
-        ttk.Label(r1, text='码率:').pack(side='left', padx=(14, 0))
-        self.var_bitrate = tk.StringVar()
-        self.cb_bitrate = ttk.Combobox(r1, textvariable=self.var_bitrate, width=8,
-                                       values=BITRATE_PRESETS)
-        self.cb_bitrate.pack(side='left', padx=4)
-        ttk.Label(r1, text='kbps').pack(side='left')
-
-        ttk.Label(r1, text='并发:').pack(side='left', padx=(14, 0))
+        ttk.Label(r1, text='并发:').pack(side='left')
         self.var_conc = tk.IntVar(value=4)
         ttk.Spinbox(r1, from_=1, to=8, width=4, textvariable=self.var_conc).pack(side='left', padx=4)
-
-        self.var_cover = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r1, text='联网嵌入封面', variable=self.var_cover).pack(side='left', padx=14)
+        self.var_cover = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r1, text='写入封面与标签', variable=self.var_cover).pack(side='left', padx=14)
+        self.var_lrc = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r1, text='带上同目录的同名 .lrc', variable=self.var_lrc).pack(side='left')
+        ttk.Label(r1, text='（输出为容器内的原始格式，不转码）',
+                  foreground=C_MUTED).pack(side='left', padx=10)
 
         r2 = ttk.Frame(opt)
         r2.pack(fill='x', padx=8, pady=(0, 8))
@@ -133,23 +105,12 @@ class DecodeTab(ttk.Frame):
         ttk.Button(r2, text='统一到下载目录', width=15,
                    command=self.use_shared_dir).pack(side='left')
 
-        r3 = ttk.Frame(opt)
-        r3.pack(fill='x', padx=8, pady=(0, 8))
-        ttk.Label(r3, text='解码器:').pack(side='left')
-        self.var_decoder = tk.StringVar()
-        ent = ttk.Entry(r3, textvariable=self.var_decoder)
-        ent.pack(side='left', fill='x', expand=True, padx=6)
-        ttk.Button(r3, text='浏览…', width=8, command=self.pick_decoder).pack(side='left')
-        self.lbl_decoder = ttk.Label(r3, text='', width=34)
-        self.lbl_decoder.pack(side='left', padx=6)
-
-        # ---- 任务列表 ----
         mid = ttk.LabelFrame(self, text=' 任务列表 ')
         mid.pack(fill='both', expand=True, **pad)
         cols = ('idx', 'file', 'size', 'status', 'output')
-        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=7)
-        for c, t, w in (('idx', '#', 46), ('file', '文件', 300), ('size', '大小', 90),
-                        ('status', '状态', 190), ('output', '输出', 300)):
+        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=12)
+        for c, t, w in (('idx', '#', 46), ('file', '文件', 320), ('size', '大小', 90),
+                        ('status', '状态', 170), ('output', '输出', 300)):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor='w',
                              stretch=(c in ('file', 'status', 'output')))
@@ -164,7 +125,6 @@ class DecodeTab(ttk.Frame):
         self.tree.bind('<Delete>', lambda e: self.remove_selected())
         enable_drop(self.tree, self._on_drop)
 
-        # ---- 操作 ----
         act = ttk.Frame(self)
         act.pack(fill='x', **pad)
         self.btn_start = ttk.Button(act, text='开始解码', width=12, command=self.on_start,
@@ -197,181 +157,38 @@ class DecodeTab(ttk.Frame):
         self.txt.pack(side='left', fill='both', expand=True, padx=(6, 0), pady=6)
         ls.pack(side='right', fill='y', pady=6)
 
-    # ------------------------------------------------------------- 设置绑定
+    # ---------------------------------------------------------------- 状态
     def restore(self):
         s = self.settings
-        name = dict(FORMAT_PRESETS).get(s.get('decode_format', 'auto'))
-        self.var_format.set(name or s.get('decode_format') or 'auto')
-        self.var_bitrate.set(s.get('decode_bitrate', '') or '')
-        self.var_conc.set(int(s.get('decode_concurrency', 4) or 4))
-        self.var_cover.set(bool(s.get('decode_cover', False)))
-        self.var_dir.set(s.get('download_dir') or '')
-        dec = find_decoder(s.get('decoder_path'))
-        self.var_decoder.set(dec or s.get('decoder_path', '') or '')
-        self._sync_bitrate_state()
-        self._refresh_decoder_label()
+        self.var_dir.set(s.get('download_dir', '') or '')
+        try:
+            self.var_conc.set(int(s.get('decode_concurrency', 4) or 4))
+        except Exception:
+            self.var_conc.set(4)
+        self.var_cover.set(bool(s.get('decode_cover', True)))
+        self.var_lrc.set(bool(s.get('decode_lrc', True)))
 
     def set_dir(self, value):
-        self.var_dir.set(value)
+        if value:
+            self.var_dir.set(value)
 
     def use_shared_dir(self):
-        self.app.sync_dir(self.app.settings.get('download_dir', ''))
+        self.var_dir.set(self.settings.get('download_dir', '') or '')
 
-    def _format_key(self):
-        """下拉框显示名 → 格式键（也允许直接输入扩展名）"""
-        txt = (self.var_format.get() or '').strip()
-        for label, key in FORMAT_PRESETS:
-            if txt == label:
-                return key
-        return txt.lower()
-
-    def _sync_bitrate_state(self):
-        key = self._format_key()
-        disabled = key in LOSSLESS_FORMATS
-        self.cb_bitrate.configure(state='disabled' if disabled else 'normal')
-        if disabled:
-            self.var_bitrate.set('')
-
-    def register_decoder_label(self, lbl):
-        """同登录状态：登记制，设置对话框关掉后不会再被写到已销毁的控件"""
-        if lbl not in self._decoder_labels:
-            self._decoder_labels.append(lbl)
-        self._push_decoder_status()
-
-    def unregister_decoder_label(self, lbl):
-        if lbl in self._decoder_labels:
-            self._decoder_labels.remove(lbl)
-
-    def _push_decoder_status(self):
-        text, color = self._decoder_status
-        for lbl in list(self._decoder_labels):
-            try:
-                lbl.configure(text=text, foreground=color)
-            except Exception:
-                try:
-                    self._decoder_labels.remove(lbl)
-                except ValueError:
-                    pass
-
-    def _refresh_decoder_label(self):
-        p = find_decoder(self.var_decoder.get())
-        if p:
-            try:
-                sz = human_size(os.path.getsize(p))
-            except OSError:
-                sz = '?'
-            self._decoder_status = ('已找到 ✓ %s' % sz, C_OK)
-        else:
-            # 状态标签是固定 34 列宽（约 242px），文案长了会被裁掉，这里保持简短；
-            # 完整说明在「开始解码」的报错框和设置页的「说明」行里。
-            self._decoder_status = ('未找到解码器（本包未附带）✗', C_BAD)
-        self._push_decoder_status()
-
-    def pick_decoder(self):
-        p = filedialog.askopenfilename(
-            title='选择 NCMDecoder.exe',
-            filetypes=[('可执行文件', '*.exe'), ('全部文件', '*.*')])
-        if p:
-            self.var_decoder.set(os.path.normpath(p))
-            self._refresh_decoder_label()
-
-    # ------------------------------------------------------------- 文件管理
-    def _add_paths(self, paths):
-        """把文件/文件夹加入队列。
-
-        解码进行中一律拒绝：此时 _rebuild_tree 会把所有状态刷回「等待」，
-        而行号是结果回填的依据，重建会让状态错位到别的文件上，
-        新加进来的文件又不会被正在跑的线程处理。
-        """
-        if self.busy:
-            self.log('· 解码进行中，暂不能修改队列（可先点「停止」）')
-            return 0
-        seen = set(self.files)      # 原先用 list 判重，上千个文件时是 O(n²)
-        added = 0
-        for p in paths:
-            if os.path.isdir(p):
-                for root, _dirs, names in os.walk(p):
-                    for n in sorted(names):
-                        if n.lower().endswith('.ncm'):
-                            fp = os.path.join(root, n)
-                            if fp not in seen:
-                                seen.add(fp)
-                                self.files.append(fp)
-                                self._remember_size(fp)
-                                added += 1
-            elif os.path.isfile(p) and p.lower().endswith('.ncm'):
-                if p not in seen:
-                    seen.add(p)
-                    self.files.append(p)
-                    self._remember_size(p)
-                    added += 1
-        self._rebuild_tree()
-        self.log('已添加 %d 个文件（队列共 %d 个）' % (added, len(self.files)))
-        return added
-
-    def _remember_size(self, path):
+    def _read_concurrency(self):
+        """Spinbox 允许任意键入，IntVar.get() 遇到非数字会抛 TclError —— 必须兜住，
+        否则点「开始解码」时异常直接冒泡到 Tk，按钮看起来像完全没反应。"""
         try:
-            self._sizes[path] = os.path.getsize(path)
-        except OSError:
-            self._sizes[path] = None
-
-    def add_files(self):
-        ps = filedialog.askopenfilenames(
-            title='选择 .ncm 文件',
-            filetypes=[('NCM 文件', '*.ncm'), ('全部文件', '*.*')])
-        if ps:
-            self._add_paths([os.path.normpath(p) for p in ps])
-
-    def add_folder(self):
-        d = filedialog.askdirectory(title='选择包含 .ncm 的文件夹')
-        if d:
-            self._add_paths([os.path.normpath(d)])
-
-    def _on_drop(self, event):
-        paths = split_drop_paths(self, event.data)
-        # 拖到 EXE 图标那种多参数场景也一并处理
-        if paths:
-            self._add_paths([os.path.normpath(p) for p in paths])
-        return event.action if hasattr(event, 'action') else None
-
-    def remove_selected(self):
-        if self.busy:
-            return
-        sel = set(self.tree.selection())
-        keep = [f for i, f in enumerate(self.files) if str(i) not in sel]
-        self.files = keep
-        self._rebuild_tree()
-
-    def clear(self):
-        if self.busy:
-            return
-        self.files = []
-        self._sizes = {}
-        self._rebuild_tree()
-
-    def _rebuild_tree(self):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        for i, f in enumerate(self.files):
-            # 大小在入队时已缓存，这里不再逐个 stat —— 否则上千个文件会卡住界面
-            n = self._sizes.get(f)
-            sz = human_size(n) if n else '-'
-            self.tree.insert('', 'end', iid=str(i),
-                             values=(i + 1, os.path.basename(f), sz, '等待', ''))
-        self.lbl_prog.configure(text='0 / %d' % len(self.files))
-        self.bar['value'] = 0
-
-    def open_dir(self):
-        d = self.var_dir.get().strip()
-        if not d or not os.path.isdir(d):
-            messagebox.showwarning('目录不存在', '输出目录还不存在：\n%s' % d)
-            return
+            n = int(self.var_conc.get())
+        except Exception:
+            n = 4
+        n = max(1, min(8, n))
         try:
-            os.startfile(d)
-        except Exception as e:
-            messagebox.showerror('打开失败', str(e))
+            self.var_conc.set(n)        # 回写纠正后的值，让用户看到实际生效的并发
+        except Exception:
+            pass
+        return n
 
-    # ----------------------------------------------------------------- 日志
     def log(self, msg):
         self.log_many([msg])
 
@@ -395,35 +212,101 @@ class DecodeTab(ttk.Frame):
         for b in self._file_btns:
             b.configure(state='disabled' if busy else 'normal')
 
-    # ----------------------------------------------------------------- 执行
-    def _read_concurrency(self):
-        """Spinbox 允许任意键入，IntVar.get() 遇到非数字会抛 TclError —— 必须兜住，
-        否则点「开始解码」时异常直接冒泡到 Tk，按钮看起来像完全没反应。"""
-        try:
-            n = int(self.var_conc.get())
-        except Exception:
-            n = 4
-        n = max(1, min(8, n))
-        try:
-            self.var_conc.set(n)    # 回写纠正后的值，让用户看到实际生效的并发
-        except Exception:
-            pass
-        return n
+    # ------------------------------------------------------------- 文件管理
+    def _add_paths(self, paths):
+        """把文件/文件夹加入队列。
 
+        解码进行中一律拒绝：此时 _rebuild_tree 会把所有状态刷回「等待」，
+        而行号是结果回填的依据，重建会让状态错位到别的文件上，
+        新加进来的文件又不会被正在跑的线程处理。
+        """
+        if self.busy:
+            self.log('· 解码进行中，不能改动队列')
+            return
+        added = 0
+        for p in paths:
+            p = os.path.normpath(p)
+            if os.path.isdir(p):
+                for root, _d, fs in os.walk(p):
+                    for fn in fs:
+                        if fn.lower().endswith('.ncm'):
+                            fp = os.path.normpath(os.path.join(root, fn))
+                            if fp not in self.files:
+                                self.files.append(fp)
+                                added += 1
+            elif p.lower().endswith('.ncm') and os.path.isfile(p):
+                if p not in self.files:
+                    self.files.append(p)
+                    added += 1
+        if added:
+            self._rebuild_tree()
+            self.log('√ 加入 %d 个 .ncm，队列共 %d 个' % (added, len(self.files)))
+        elif paths:
+            self.log('· 没有新增（已在本页队列里，或不含 .ncm）')
+
+    def _remember_size(self, path):
+        try:
+            self.sizes[path] = os.path.getsize(path)
+        except OSError:
+            self.sizes[path] = 0
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(title='选择 .ncm 文件',
+                                            filetypes=[('NCM 文件', '*.ncm'), ('全部文件', '*.*')])
+        if paths:
+            self._add_paths(list(paths))
+
+    def add_folder(self):
+        d = filedialog.askdirectory(title='选择包含 .ncm 的文件夹')
+        if d:
+            self._add_paths([d])
+
+    def _on_drop(self, event):
+        self._add_paths(split_drop_paths(self, event.data))
+
+    def remove_selected(self):
+        if self.busy:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idxs = {int(i) for i in sel if str(i).isdigit()}
+        self.files = [p for i, p in enumerate(self.files) if i not in idxs]
+        self._rebuild_tree()
+
+    def clear(self):
+        if self.busy:
+            return
+        self.files = []
+        self.sizes = {}
+        self._rebuild_tree()
+
+    def _rebuild_tree(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        for i, p in enumerate(self.files):
+            self._remember_size(p)
+            self.tree.insert('', 'end', iid=str(i), values=(
+                i + 1, os.path.basename(p), human_size(self.sizes.get(p, 0)), '等待', ''))
+        self.bar['value'] = 0
+        self.lbl_prog.configure(text='0 / %d' % len(self.files))
+
+    def open_dir(self):
+        d = self.var_dir.get().strip()
+        if not d or not os.path.isdir(d):
+            messagebox.showwarning('目录不存在', '输出目录还不存在：\n%s' % d)
+            return
+        try:
+            os.startfile(d)
+        except Exception as e:
+            self.log('× 打不开目录: %s' % e)
+
+    # ----------------------------------------------------------------- 执行
     def on_start(self):
         if self.busy:
             return
         if not self.files:
             messagebox.showwarning('队列为空', '请先添加 .ncm 文件或文件夹。')
-            return
-        dec = find_decoder(self.var_decoder.get())
-        if not dec:
-            messagebox.showerror(
-                '找不到解码器',
-                'NCMDecoder.exe 是外部独立程序，本便携包没有附带。\n\n'
-                '拿到解码器之后二选一：\n'
-                '  · 把它放进本文件夹（或其 dist\\ 子目录），会自动识别\n'
-                '  · 或在上方「解码参数 → 解码器」框里填完整路径 / 点「浏览…」指定')
             return
         outdir = self.var_dir.get().strip()
         if not outdir:
@@ -431,11 +314,9 @@ class DecodeTab(ttk.Frame):
             return
 
         self.settings.update({
-            'decoder_path': self.var_decoder.get().strip(),
-            'decode_format': self._format_key(),
-            'decode_bitrate': self.var_bitrate.get().strip(),
             'decode_concurrency': self._read_concurrency(),
             'decode_cover': bool(self.var_cover.get()),
+            'decode_lrc': bool(self.var_lrc.get()),
         })
         self.app.persist()
         self.app.sync_dir(outdir)
@@ -450,22 +331,16 @@ class DecodeTab(ttk.Frame):
                 self.tree.set(str(i), 'output', '')
                 self.tree.item(str(i), tags=())
         self.bar['value'] = 0
-        threading.Thread(target=self._worker, args=(dec, outdir), daemon=True).start()
+        threading.Thread(target=self._worker, args=(outdir,), daemon=True).start()
 
     def on_stop(self):
         self.stop_event.set()
-        self.log('收到停止请求，正在结束子进程…')
-        with self._lock:
-            for p in list(self._procs.values()):
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
+        self.log('收到停止请求，正在收尾…（当前文件解完就停）')
 
-    def _worker(self, decoder, outdir):
+    def _worker(self, outdir):
         files = list(self.files)
         total = len(files)
-        conc = max(1, min(8, int(self.settings.get('decode_concurrency', 4))))
+        conc = max(1, min(8, int(self.settings.get('decode_concurrency', 4) or 4)))
         done = ok = fail = cancelled = dup = 0
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -482,22 +357,20 @@ class DecodeTab(ttk.Frame):
         except OSError:
             pass
 
-        self.q.put(('log', '开始解码 %d 个文件，并发 %d，格式 %s，输出 %s'
-                    % (total, conc, self.settings['decode_format'], outdir)))
-
+        self.q.put(('log', '开始解码 %d 个文件，并发 %d，输出 %s' % (total, conc, outdir)))
         try:
             with ThreadPoolExecutor(max_workers=conc) as ex:
-                futs = {ex.submit(self._decode_one, decoder, i, p, outdir): i
+                futs = {ex.submit(self._decode_one, i, p, outdir): i
                         for i, p in enumerate(files)}
                 for fut in as_completed(futs):
                     idx = futs[fut]
                     try:
-                        status, text, outp, warns = fut.result()
+                        status, text, outp = fut.result()
                     except Exception as e:
-                        status, text, outp, warns = 'fail', '异常: %s' % e, '', []
+                        status, text, outp = 'fail', '异常: %s' % e, ''
                         self.q.put(('log', traceback.format_exc()))
-                    tag = {'ok': 'ok', 'fail': 'fail', 'skip': 'skip',
-                           'dup': 'skip'}.get(status, 'fail')
+                    tag = {'ok': 'ok', 'fail': 'fail',
+                           'skip': 'skip', 'dup': 'skip'}.get(status, 'fail')
                     self.q.put(('row', idx, text, tag, outp))
                     if status == 'ok':
                         ok += 1
@@ -508,8 +381,6 @@ class DecodeTab(ttk.Frame):
                     else:
                         fail += 1
                         self.q.put(('log', '  × %s：%s' % (os.path.basename(files[idx]), text)))
-                    for w in warns:
-                        self.q.put(('log', '  ! %s: %s' % (os.path.basename(files[idx]), w)))
                     done += 1
                     self.q.put(('progress', done, total))
         except Exception as e:
@@ -520,88 +391,55 @@ class DecodeTab(ttk.Frame):
                         % (ok, dup, fail, cancelled, total)))
             self.q.put(('finished',))
 
-    @staticmethod
-    def _read_warns(logf):
-        """读 -log 文件里的 WARN（例如转码失败已降级为原格式）"""
-        warns = []
+    # ------------------------------------------------------------ 单个文件
+    def _target_name(self, meta, src, fmt):
+        """命名沿用下载页的「命名格式」，让解出来的文件和下载的文件在库里保持一致"""
+        title = safe_name(meta.get('musicName')
+                          or os.path.splitext(os.path.basename(src))[0])
+        artist = safe_name(ncm_dump.artists(meta) or '未知歌手')
         try:
-            with open(logf, 'r', encoding='utf-8', errors='replace') as f:
-                for line in f:
-                    m = RE_WARN.search(line)
-                    if m:
-                        # 转码失败会把 ffmpeg 的多行输出带进来，压成一行
-                        warns.append(re.sub(r'\s+', ' ', m.group(1).strip())[:220])
+            nt = int(self.settings.get('name_type', 1) or 1)
         except Exception:
-            pass
-        return warns
+            nt = 1
+        if nt == 2:
+            return '%s - %s.%s' % (artist, title, fmt)
+        if nt == 3:
+            return '%s - %s.%s' % (title, artist, fmt)
+        return '%s.%s' % (title, fmt)
 
-    def _build_cmd(self, decoder, path, outdir, logf):
-        cmd = [decoder, '-i', path, '-o', outdir, '-c', '1', '-log', logf]
-        fmt = self.settings.get('decode_format', 'auto')
-        if fmt and fmt != 'auto':
-            cmd += ['-f', fmt]
-        br = (self.settings.get('decode_bitrate') or '').strip()
-        if br and fmt.lower() not in LOSSLESS_FORMATS:
-            cmd += ['-b', br]
-        if self.settings.get('decode_cover'):
-            cmd += ['-cover']
-        return cmd
-
-    def _run_decoder(self, decoder, idx, path, outdir, logf):
-        """跑一次解码；返回 (status, 文本, 输出路径, 警告, 错误码)"""
+    def _apply_tags(self, path, meta, image, lyrics):
+        """写封面 + 标签。write_tags 收的是封面文件路径，所以先把图片落成临时文件。"""
+        cover_path = None
         try:
-            p = subprocess.Popen(
-                self._build_cmd(decoder, path, outdir, logf),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=CREATE_NO_WINDOW)
+            if image:
+                ext = '.png' if image[:8] == b'\x89PNG\r\n\x1a\n' else '.jpg'
+                fd, cover_path = tempfile.mkstemp(suffix=ext,
+                                                  dir=self._tmpdir or tempfile.gettempdir())
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(image)
+            return write_tags(path, cover_path,
+                              meta.get('musicName') or '',
+                              ncm_dump.artists(meta),
+                              meta.get('album') or '', '', lyrics)
         except Exception as e:
-            return 'fail', '启动解码器失败: %s' % e, '', [], None
-
-        with self._lock:
-            self._procs[idx] = p
-        try:
-            so, _se = p.communicate()
-        except Exception as e:
-            return 'fail', '等待解码器失败: %s' % e, '', [], None
+            return False, '写标签失败: %s' % e
         finally:
-            with self._lock:
-                self._procs.pop(idx, None)
+            if cover_path:
+                try:
+                    os.remove(cover_path)
+                except OSError:
+                    pass
 
-        txt = (so or b'').decode('utf-8', 'replace')
-
-        # 先看是否真的成功了 —— 已完成的任务不能因为随后点了停止而被误标为取消
-        if p.returncode == 0:
-            m = RE_OK.search(txt)
-            if m:
-                return 'ok', '完成', m.group(2).strip(), self._read_warns(logf), 0
-        if self.stop_event.is_set():
-            return 'skip', '已取消', '', [], None
-
-        warns = self._read_warns(logf)
-        m = RE_FAIL.search(txt)
-        if m:
-            code = int(m.group(2))
-            detail = (m.group(3) or '').strip()
-            reason = DECODER_ERRORS.get(code, '')
-            text = '失败(%d) %s' % (code, reason or detail)
-            if reason and detail and detail not in reason:
-                text += '｜' + detail
-            return 'fail', text[:120], '', warns, code
-
-        tail = (txt.strip().splitlines() or [''])[-1]
-        return 'fail', '失败(退出码 %s) %s' % (p.returncode, tail[:80]), '', warns, None
-
-    def _claim_output(self, src, outdir):
-        """把临时目录里的成品移入音乐库，返回 (最终路径, 是否与已有文件重复)。
+    def _claim_output(self, src, outdir, final_name):
+        """把临时目录里的成品按 final_name 移入音乐库，返回 (最终路径, 是否与已有文件重复)。
 
         重名时先比内容：完全一致说明这首之前已经解过，直接丢弃新产物并复用旧文件，
         免得音乐库里越堆越多 X (1).mp3、X (2).mp3…；内容不同才退让成 (n) 命名。
         判重放在锁内，防止并发抢名。
         """
-        name = os.path.basename(src)
-        base, ext = os.path.splitext(name)
+        base, ext = os.path.splitext(final_name)
         with self._name_lock:
-            dest = os.path.join(outdir, name)
+            dest = os.path.join(outdir, final_name)
             if os.path.exists(dest) and same_file(src, dest):
                 return dest, True
             n = 1
@@ -611,53 +449,73 @@ class DecodeTab(ttk.Frame):
             os.replace(src, dest)      # 临时目录在 outdir 下，同卷，是原子的
         return dest, False
 
-    def _decode_one(self, decoder, idx, path, outdir):
-        """解码单个文件；返回 (status, 状态文本, 输出路径, 警告列表)
+    def _decode_one(self, idx, path, outdir):
+        """解码单个文件；返回 (status, 状态文本, 输出路径)。
 
         每个任务写到自己的临时子目录，再原子移入音乐库，好处有二：
-          1) 并发时不会互相抢同一个输出文件名（解码器内部按"存在即加 (n)"去重，会撞车）
+          1) 并发时不会互相抢同一个输出文件名
           2) 中途取消留下的半成品只在临时目录里，随删随净，不会污染音乐库
         """
         if self.stop_event.is_set():
-            return 'skip', '已取消', '', []
+            return 'skip', '已取消', ''
 
         self.q.put(('row', idx, '解码中', 'run', ''))
-        logf = os.path.join(self._tmpdir, 'd%d.log' % idx)
         tmp_out = os.path.join(outdir, '_ncm_tmp_%d_%d' % (idx, random.randint(1000, 99999)))
         try:
             os.makedirs(tmp_out, exist_ok=True)
         except OSError as e:
-            return 'fail', '无法创建临时目录: %s' % e, '', []
+            return 'fail', '无法创建临时目录: %s' % e, ''
 
         try:
-            res = ('fail', '未执行', '', [], None)
-            for attempt in range(self.RETRY_MAX):
-                res = self._run_decoder(decoder, idx, path, tmp_out, logf)
-                status, text, outp, warns, code = res
-                if status != 'fail' or code not in self.RETRY_CODES:
-                    break
-                if self.stop_event.is_set():
-                    return 'skip', '已取消', '', []
-                if attempt < self.RETRY_MAX - 1:
-                    backoff = 0.3 * (attempt + 1) + random.random() * 0.3
-                    self.q.put(('log', '  · %s 输出名冲突，%.1fs 后重试（%d/%d）'
-                                % (os.path.basename(path), backoff, attempt + 1, self.RETRY_MAX - 1)))
-                    time.sleep(backoff)
+            raw = os.path.join(tmp_out, 'audio.raw')
+            try:
+                _p, fmt, meta, image = ncm_dump.decrypt(path, raw, stop=self.stop_event)
+            except ncm_dump.NcmError as e:
+                if '取消' in str(e):
+                    return 'skip', '已取消', ''
+                return 'fail', str(e)[:120], ''
+            except Exception as e:
+                return 'fail', '解密失败: %s' % e, ''
 
-            status, text, outp, warns, code = res
-            if status == 'ok':
-                if not (outp and os.path.isfile(outp)):
-                    # 解码器报成功但路径不符预期，退一步在临时目录里找
-                    found = [f for f in os.listdir(tmp_out)
-                             if not f.endswith('.log')] if os.path.isdir(tmp_out) else []
-                    outp = os.path.join(tmp_out, found[0]) if found else None
-                if outp and os.path.isfile(outp):
-                    final, dup = self._claim_output(outp, outdir)
-                    if dup:
-                        return 'dup', '已存在', final, warns
-                    return 'ok', '完成', final, warns
-                return 'fail', '解码器报成功，但未找到输出文件', '', warns
-            return status, text, outp, warns
+            size = os.path.getsize(raw) if os.path.isfile(raw) else 0
+            if size < 1024:
+                # 和下载页同一个原则：宁可报错，也不把几十字节的东西放进音乐库
+                return 'fail', '解出来的音频过小（%d 字节）' % size, ''
+
+            name = self._target_name(meta, path, fmt)
+            final = os.path.join(tmp_out, name)
+            os.replace(raw, final)
+
+            warns = []
+            lyrics = None
+            lrc_src = os.path.splitext(path)[0] + '.lrc'
+            if self.settings.get('decode_lrc', True) and os.path.isfile(lrc_src):
+                try:
+                    with open(lrc_src, 'r', encoding='utf-8', errors='replace') as f:
+                        lyrics = ncm_dump.normalize_lrc(f.read())
+                except OSError as e:
+                    warns.append('读歌词失败: %s' % e)
+            if self.settings.get('decode_cover', True):
+                ok_t, msg = self._apply_tags(final, meta, image, lyrics)
+                if not ok_t:
+                    warns.append(msg)
+
+            dest, dup = self._claim_output(final, outdir, name)
+            for w in warns:
+                self.q.put(('log', '  ! %s: %s' % (os.path.basename(path), w)))
+            if dup:
+                return 'dup', '已存在', dest
+
+            # 落盘的也是归一化后的文本：原始 .lrc 里混着 JSON 行，直接拷过去播放器认不了
+            if lyrics and self.settings.get('decode_lrc', True):
+                dst_lrc = os.path.splitext(dest)[0] + '.lrc'
+                if not os.path.exists(dst_lrc):
+                    try:
+                        with open(dst_lrc, 'w', encoding='utf-8') as f:
+                            f.write(lyrics)
+                    except OSError:
+                        pass
+            return 'ok', '完成', dest
         finally:
             shutil.rmtree(tmp_out, ignore_errors=True)
 
@@ -700,5 +558,5 @@ class DecodeTab(ttk.Frame):
                         self._tmpdir = None
         except queue.Empty:
             flush()
-        # 有积压或仍在跑就快轮询，彻底空闲后放慢，避免每秒无谓唤醒 12 次
+        # 有积压或仍在跑就快轮询，彻底空闲后放慢，避免每秒无谓唤醒
         self.after(BUSY_POLL_MS if (got or self.busy) else IDLE_POLL_MS, self._drain)

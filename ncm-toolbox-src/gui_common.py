@@ -8,7 +8,6 @@ import ctypes
 import json
 import os
 import re
-import shutil
 
 from ncm.constants import headers
 
@@ -128,40 +127,6 @@ KIND_LABEL = {
 }
 
 
-# --------------------------------------------------------------------------- #
-# NCM 解码相关常量（与 C# 端 Ffmpeg.Presets 保持一致）
-# --------------------------------------------------------------------------- #
-FORMAT_PRESETS = [
-    ('自动（保持原格式）', 'auto'),
-    ('FLAC（无损）', 'flac'),
-    ('WAV（无压缩）', 'wav'),
-    ('ALAC（无损 · m4a）', 'alac'),
-    ('MP3（有损）', 'mp3'),
-    ('AAC（有损 · m4a）', 'aac'),
-    ('OGG Vorbis（有损）', 'ogg'),
-    ('Opus（有损）', 'opus'),
-    ('WMA（有损）', 'wma'),
-]
-BITRATE_PRESETS = ['128', '192', '256', '320']
-
-# 无损 / 不转码格式：码率输入框应禁用
-LOSSLESS_FORMATS = {'auto', 'flac', 'wav', 'alac'}
-
-DECODER_ERRORS = {
-    0: '成功',
-    1001: '源文件读取失败（不存在/无权限/IO）',
-    1002: '输出目录不可用',
-    1003: '输出文件写入失败',
-    2001: '非 NCM 文件（魔数校验失败）',
-    2002: '文件头不完整（文件过小/被截断）',
-    2003: '密钥段损坏',
-    2004: '密钥解密失败',
-    2005: '元数据段损坏',
-    2006: '音频数据定位失败',
-    2007: '不支持的音频格式',
-    3001: '任务已取消',
-    9999: '未知错误',
-}
 
 DEFAULT_SETTINGS = {
     # 在线下载
@@ -177,12 +142,10 @@ DEFAULT_SETTINGS = {
     'download_interval': 1.0,    # 每首之间的间隔（秒）
                                  # 批量下载时短时间高频请求是风控最敏感的模式，
                                  # 默认留 1 秒缓冲，别把它调成 0 去跑几百首。
-    # NCM 解码
-    'decoder_path': '',
-    'decode_format': 'auto',
-    'decode_bitrate': '',
+    # NCM 解码（内置解密，只解容器不转码）
     'decode_concurrency': 4,
-    'decode_cover': False,
+    'decode_cover': True,
+    'decode_lrc': True,
 }
 
 
@@ -373,57 +336,6 @@ VIP_TYPE_LABEL = {
     11: '黑胶 VIP',
     100: '黑胶 SVIP',
 }
-
-
-_DECODER_CACHE = {'key': None, 'value': None, 'at': 0.0}
-
-
-def find_decoder(explicit=None, ttl=5.0):
-    """定位 NCMDecoder.exe / NCM解码器.exe，返回路径或 None。
-
-    结果缓存 ttl 秒：界面多处会调用它，而 shutil.which 要扫 PATH，不缓存会白跑很多次。
-    """
-    import time
-    key = (explicit or '').strip()
-    now = time.time()
-    c = _DECODER_CACHE
-    if c['key'] == key and (now - c['at']) < ttl:
-        return c['value']
-    val = _find_decoder_uncached(key)
-    c.update(key=key, value=val, at=now)
-    return val
-
-
-def _find_decoder_uncached(explicit=None):
-    """按 设置值 → 程序目录 → 程序目录\\dist → 上级\\dist → PATH 的顺序找解码器。
-
-    NCMDecoder.exe 是外部独立程序，不随本便携包分发，所以「找不到」是正常状态，
-    由界面提示用户自行指定；这里不再内置任何作者机器上的绝对路径。
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    cands = []
-    if explicit:
-        cands.append(explicit.strip())
-    names = ('NCM解码器.exe', 'NCMDecoder.exe', 'NCMDecoder')
-    for n in names:
-        cands.append(os.path.join(here, n))
-    for root in (os.path.join(here, 'dist'),
-                 os.path.join(os.path.dirname(here), 'dist')):
-        for n in names:
-            cands.append(os.path.join(root, n))
-    try:
-        w = shutil.which('NCMDecoder.exe') or shutil.which('NCM解码器.exe')
-        if w:
-            cands.append(w)
-    except Exception:
-        pass
-    for c in cands:
-        try:
-            if c and os.path.isfile(c):
-                return c
-        except Exception:
-            pass
-    return None
 
 
 # --------------------------------------------------------------------------- #

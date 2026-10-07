@@ -10,7 +10,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from gui_common import C_MUTED, C_OK, C_WARN, FORMAT_PRESETS, QUALITIES
+from gui_common import C_MUTED, C_OK, C_WARN, QUALITIES
 
 
 class SettingsDialog(tk.Toplevel):
@@ -146,51 +146,39 @@ class SettingsDialog(tk.Toplevel):
         f = ttk.Frame(parent)
         pad = {'padx': 12, 'pady': 4}
 
-        g = ttk.LabelFrame(f, text=' 解码器 ')
-        g.pack(fill='x', **pad)
-        r = ttk.Frame(g)
-        r.pack(fill='x', padx=10, pady=(8, 4))
-        ttk.Label(r, text='程序路径:', width=10).pack(side='left')
-        ttk.Entry(r, textvariable=self.dc.var_decoder).pack(
-            side='left', fill='x', expand=True, padx=4)
-        ttk.Button(r, text='浏览…', width=8, command=self._pick_decoder).pack(side='left')
-
-        r = ttk.Frame(g)
-        r.pack(fill='x', padx=10, pady=(0, 4))
-        ttk.Label(r, text='', width=10).pack(side='left')
-        self.lbl_decoder = ttk.Label(r, text='', foreground=C_MUTED)
-        self.lbl_decoder.pack(side='left', padx=4)
-        self.dc.register_decoder_label(self.lbl_decoder)
-        self.dc._refresh_decoder_label()
-
-        r = ttk.Frame(g)
-        r.pack(fill='x', padx=10, pady=(0, 8))
-        ttk.Label(r, text='说明:', width=10).pack(side='left')
-        ttk.Label(r, text='解码器是外部独立程序，本便携包未附带。放进本文件夹或其 dist\\ 子目录会自动识别。',
-                  foreground=C_MUTED).pack(side='left', padx=4)
-
-        d = ttk.LabelFrame(f, text=' 默认参数（每次运行仍可在解码页临时修改） ')
+        d = ttk.LabelFrame(f, text=' NCM 解码 ')
         d.pack(fill='x', **pad)
-        r = ttk.Frame(d)
-        r.pack(fill='x', padx=10, pady=(8, 4))
-        ttk.Label(r, text='输出格式:', width=10).pack(side='left')
-        ttk.Combobox(r, textvariable=self.dc.var_format, width=20,
-                     values=[n for n, _ in FORMAT_PRESETS]).pack(side='left', padx=4)
-        ttk.Label(r, text='（可直接输入扩展名）', foreground=C_MUTED).pack(side='left', padx=4)
 
         r = ttk.Frame(d)
-        r.pack(fill='x', padx=10, pady=(0, 4))
-        ttk.Label(r, text='并发:', width=10).pack(side='left')
+        r.pack(fill='x', padx=10, pady=(8, 4))
+        ttk.Label(r, text='并发:', width=11).pack(side='left')
         ttk.Spinbox(r, from_=1, to=8, width=5,
                     textvariable=self.dc.var_conc).pack(side='left', padx=4)
-        ttk.Checkbutton(r, text='联网嵌入封面',
-                        variable=self.dc.var_cover).pack(side='left', padx=12)
+        ttk.Label(r, text='（1–8；解码是 CPU 密集，超过核数不会更快）',
+                  foreground=C_MUTED).pack(side='left', padx=6)
+
+        r = ttk.Frame(d)
+        r.pack(fill='x', padx=10, pady=(0, 4))
+        ttk.Label(r, text='附加内容:', width=11).pack(side='left')
+        ttk.Checkbutton(r, text='写入封面与标签',
+                        variable=self.dc.var_cover).pack(side='left', padx=4)
+        ttk.Checkbutton(r, text='带上同目录的同名 .lrc',
+                        variable=self.dc.var_lrc).pack(side='left', padx=4)
+
+        r = ttk.Frame(d)
+        r.pack(fill='x', padx=10, pady=(0, 4))
+        ttk.Label(r, text='命名格式:', width=11).pack(side='left')
+        ttk.Label(r, text='沿用「下载」页的命名格式，解出来的文件和下载的文件在库里一致。',
+                  foreground=C_MUTED).pack(side='left', padx=4)
 
         r = ttk.Frame(d)
         r.pack(fill='x', padx=10, pady=(0, 8))
-        ttk.Label(r, text='输出目录:', width=10).pack(side='left')
+        ttk.Label(r, text='输出目录:', width=11).pack(side='left')
         ttk.Label(r, text='与下载页共用「音乐库目录」，在上面的「下载」页里改。',
                   foreground=C_MUTED).pack(side='left', padx=4)
+
+        ttk.Label(f, text='解密已内置，不需要任何外部程序；输出为容器内的原始格式（mp3 / flac），不做转码。',
+                  foreground=C_MUTED).pack(anchor='w', padx=14, pady=(2, 8))
         return f
 
     # -------------------------------------------------------------- 交互
@@ -208,16 +196,6 @@ class SettingsDialog(tk.Toplevel):
             self.dl.var_dir.set(os.path.normpath(d))
             self.dl.app.sync_dir(self.dl.var_dir.get())
             self._flash('已更新音乐库目录')
-
-    def _pick_decoder(self):
-        from tkinter import filedialog
-        p = filedialog.askopenfilename(title='选择 NCMDecoder.exe',
-                                       filetypes=[('可执行文件', '*.exe'), ('全部文件', '*.*')])
-        if p:
-            import os
-            self.dc.var_decoder.set(os.path.normpath(p))
-            self.dc._refresh_decoder_label()
-            self._flash('已更新解码器路径')
 
     def _flash(self, msg):
         self.lbl_saved.configure(text=msg)
@@ -242,7 +220,6 @@ class SettingsDialog(tk.Toplevel):
         # 注销标签，否则下载逻辑之后还会往已销毁的控件里写，抛 TclError
         try:
             self.dl.unregister_login_label(self.lbl_login)
-            self.dc.unregister_decoder_label(self.lbl_decoder)
         except Exception:
             pass
         try:

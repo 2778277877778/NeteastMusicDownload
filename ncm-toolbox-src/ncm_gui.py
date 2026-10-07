@@ -4,7 +4,7 @@
 
 把两件事合成一个应用，共用一个音乐库目录：
   * 「在线下载」：走网易云 API 直接下载带标签/封面的音频
-  * 「NCM 解码」：驱动 NCMDecoder.exe 把本地 .ncm 解码成通用格式
+  * 「NCM 解码」：用内置的纯 Python 解密把本地 .ncm 还原成原始 mp3/flac（见 ncm_dump.py）
 
 入口：python ncm_gui.py
 """
