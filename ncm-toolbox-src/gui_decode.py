@@ -2,7 +2,7 @@
 r"""
 「NCM 解码」标签页：把本地 .ncm 解密成可播放的 mp3 / flac。
 
-V2.0 起改为**内置纯 Python 解密**（见 ncm_dump.py，算法照搬 taurusxin/ncmdump，MIT），
+V3.0 起改为**内置纯 Python 解密**（见 ncm_dump.py，算法照搬 taurusxin/ncmdump，MIT），
 不再驱动外部 NCMDecoder.exe —— 少一个"包里没附带"的依赖，状态、进度、取消也都能
 精确到单个文件。
 

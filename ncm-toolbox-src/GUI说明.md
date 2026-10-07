@@ -77,7 +77,7 @@ https://music.163.com/#/playlist?id=xxx   ← 歌单
 
 ## 页签二：NCM 解码
 
-把本地的 `.ncm` 解密成容器里的原始 mp3 / flac。**V2.0 起解密内置**（`ncm_dump.py`，
+把本地的 `.ncm` 解密成容器里的原始 mp3 / flac。**V3.0 起解密内置**（`ncm_dump.py`，
 纯 Python，算法与常量照搬 `taurusxin/ncmdump` 的 `src/ncmcrypt.cpp`，MIT），
 不再依赖外部 `NCMDecoder.exe`。
 
