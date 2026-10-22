@@ -42,6 +42,7 @@ from gui_common import (
     append_log,
     apply_cookie,
     build_lrc_text,
+    clean_space,
     cover_url_of,
     enable_drop,
     fetch_account,
@@ -927,18 +928,21 @@ class DownloadTab(ttk.Frame):
         """
         try:
             title, artist, album, _ = song_meta(song, is_program)
+            # 磁盘上的旧标签可能是折空白之前写的，两边都归一化再比，
+            # 否则同一首歌会因为 NBSP/普通空格之别被判成不同曲目，重复下载。
+            title, artist, album = clean_space(title), clean_space(artist), clean_space(album)
             ext = os.path.splitext(path)[1].lower()
             if ext == '.flac':
                 from mutagen.flac import FLAC
                 a = FLAC(path)
-                g = lambda k: ((a.get(k) or [''])[0])
+                g = lambda k: clean_space((a.get(k) or [''])[0])
                 return g('title') == title and g('artist') == artist
             if ext == '.mp3':
                 from mutagen.id3 import ID3
                 t = ID3(path)
-                return (str(t.get('TIT2') or '') == title
-                        and str(t.get('TPE1') or '') == artist
-                        and str(t.get('TALB') or '') == album)
+                return (clean_space(str(t.get('TIT2') or '')) == title
+                        and clean_space(str(t.get('TPE1') or '')) == artist
+                        and clean_space(str(t.get('TALB') or '')) == album)
         except Exception:
             return False
         return False
@@ -1060,7 +1064,9 @@ class DownloadTab(ttk.Frame):
                 self.q.put(('log', '  · 歌词获取失败: %s' % e))
 
         raw_title, raw_artist, raw_album, raw_track = song_meta(song, is_program)
-        good, msg = write_tags(path, cover_path, raw_title, raw_artist, raw_album, raw_track,
+        # 用折过空白的 title/artist/album 写标签：接口原文里的 NBSP 不折掉
+        # 就会留在 TIT2 里，播放器按本地代码页解码后显示成乱码。
+        good, msg = write_tags(path, cover_path, title, artist, album, raw_track,
                                lrc_text if s.get('embed_lyrics') else None)
         if not good:
             self.q.put(('log', '  · 标签写入失败: %s' % msg))

@@ -155,14 +155,44 @@ DEFAULT_SETTINGS = {
 MAX_NAME_LEN = 180
 
 
+# 网易云的元数据里偶有「看起来是空格、其实不是 U+0020」的字符：
+#   U+00A0 NBSP         —— song name 里真实出现过（如 'Where\xa0Is\xa0Your\xa0Love'）
+#   U+3000 全角空格     —— 日文标题的排版习惯
+#   U+2007/2009/202F    —— 各种窄空格
+#   U+200B/200C/200D    —— 零宽字符，肉眼完全看不见
+#   U+FEFF              —— 零宽不换行空格
+# 这些字符留着会出两类问题：
+#   1) 文件名里带着它，非 Unicode 程序按本地代码页解码会显示成乱码
+#      （UTF-8 的 C2 A0 在 GBK 里正好是「聽」）；
+#   2) 拿字符串做等值比较时和普通空格不相等，去重/查重会漏。
+# 统一折成普通空格，然后再合并连续空白。
+WEIRD_SPACES = ('\u00a0', '\u1680', '\u180e', '\u2000', '\u2001', '\u2002',
+                '\u2003', '\u2004', '\u2005', '\u2006', '\u2007', '\u2008',
+                '\u2009', '\u200a', '\u200b', '\u200c', '\u200d', '\u2028',
+                '\u2029', '\u202f', '\u205f', '\u2060', '\u3000', '\ufeff')
+
+_WEIRD_RE = re.compile('[%s]' % ''.join(WEIRD_SPACES))
+
+
+def clean_space(text):
+    """把各种「长得像空格」的 Unicode 字符折成普通空格，并合并连续空白。
+
+    只动空白，不动文字本身；None 和空串照旧返回。
+    """
+    if text is None:
+        return text
+    return ' '.join(_WEIRD_RE.sub(' ', str(text)).split())
+
+
 def safe_name(s):
-    """替换 Windows 非法字符，并限制长度。
+    """替换 Windows 非法字符、折掉异常空白，并限制长度。
 
     NTFS 单个文件名上限 255 字符，但 '歌手 - 歌名' 这种拼接加上扩展名、
     再加可能的 ' (n)' 去重后缀很容易超；超了会直接写文件失败。
     这里统一截到 180，留出余量。
     """
-    out = re.sub(r'[\\/:*?"<>|\t\r\n]', ' ', str(s)).strip().strip('.')
+    out = re.sub(r'[\\/:*?"<>|\t\r\n]', ' ', str(s))
+    out = clean_space(out).strip().strip('.')
     if len(out) > MAX_NAME_LEN:
         out = out[:MAX_NAME_LEN].rstrip()
     return out or 'untitled'
@@ -409,18 +439,23 @@ def cover_url_of(song, is_program):
 
 
 def song_meta(song, is_program):
-    """返回 (title, artist, album, track)"""
-    title = (song.get('name') or 'unknown').strip()
+    """返回 (title, artist, album, track)
+
+    四个字段都过一遍 clean_space：接口给的原始字符串里可能带 NBSP、全角空格
+    或零宽字符（实测 'Where\xa0Is\xa0Your\xa0Love'），不折掉的话既会写进
+    文件名、也会在标签里残留，显示成乱码或和普通空格对不上。
+    """
+    title = clean_space(song.get('name') or 'unknown')
     if is_program:
         dj = song.get('dj') or {}
-        artist = dj.get('nickname') or 'unknown'
-        album = dj.get('brand') or 'unknown'
+        artist = clean_space(dj.get('nickname') or 'unknown')
+        album = clean_space(dj.get('brand') or 'unknown')
         track = ''
     else:
         artists = song.get('artists') or []
-        artist = artists[0]['name'] if artists else 'unknown'
+        artist = clean_space(artists[0]['name']) if artists else 'unknown'
         alb = song.get('album') or {}
-        album = alb.get('name') or 'unknown'
+        album = clean_space(alb.get('name') or 'unknown')
         no = song.get('no')
         size = alb.get('size')
         track = '%s/%s' % (no, size) if no and size else ''

@@ -39,6 +39,7 @@ from gui_common import (
     C_OK,
     IDLE_POLL_MS,
     append_log,
+    clean_space,
     enable_drop,
     human_size,
     log_file_many,
@@ -418,9 +419,9 @@ class DecodeTab(ttk.Frame):
                 with os.fdopen(fd, 'wb') as f:
                     f.write(image)
             return write_tags(path, cover_path,
-                              meta.get('musicName') or '',
-                              ncm_dump.artists(meta),
-                              meta.get('album') or '', '', lyrics)
+                              clean_space(meta.get('musicName') or ''),
+                              clean_space(ncm_dump.artists(meta)),
+                              clean_space(meta.get('album') or ''), '', lyrics)
         except Exception as e:
             return False, '写标签失败: %s' % e
         finally:
