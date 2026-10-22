@@ -136,6 +136,7 @@ DEFAULT_SETTINGS = {
     'quality': 'exhigh',
     'cookie': '',
     'skip_existing': True,
+    'global_dedupe': False,      # 下载前先在整个音乐库中查重（跨歌单去重）
     'download_lyrics': True,     # 抓歌词并存成同名 .lrc
     'embed_lyrics': True,        # 同时写进音频标签（MP3=USLT / FLAC=LYRICS）
     'resume_partial': True,      # 断点续传：.part 存在时从断点继续
@@ -625,6 +626,122 @@ def write_tags(path, cover_path, title, artist, album, track, lyrics=None):
     if ext == '.mp3':
         return write_mp3_tags(path, cover_path, title, artist, album, track, lyrics)
     return False, '未知格式 %s，跳过标签写入' % ext
+
+
+# --------------------------------------------------------------------------- #
+# 音乐库索引（跨歌单去重）
+# --------------------------------------------------------------------------- #
+AUDIO_EXTS = ('.mp3', '.flac', '.m4a', '.ogg', '.oga', '.wav', '.ape', '.wma')
+
+# 时长比对容差：同名同歌手时用时长区分不同版本（现场/重制/剪辑），
+# 3 秒足够吸收编码与前后静音差异，又不会把两首真正不同的歌当成同一首。
+DURATION_TOLERANCE_MS = 3000
+
+
+def normalize_key(text):
+    """归一化用于比对的文本：忽略大小写、首尾空白和连续空格。"""
+    return ' '.join(str(text or '').casefold().split())
+
+
+def song_duration_ms(song, is_program):
+    """网易云曲目时长（毫秒）；取不到返回 0。
+
+    不同接口给的字段名不一样（dt / duration），而且偶有接口把时长按秒给，
+    这里把候选字段都试一遍，再按量级判断单位。
+    """
+    if not isinstance(song, dict):
+        return 0
+    main = song.get('mainSong')
+    if not isinstance(main, dict):
+        main = {}
+    for c in (song.get('dt'), song.get('duration'),
+              main.get('dt'), main.get('duration')):
+        try:
+            v = float(c or 0)
+        except (TypeError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        if 10 < v < 10000:            # 以秒给出
+            v *= 1000
+        return int(round(v))
+    return 0
+
+
+class LibraryIndex:
+    """整个下载目录的音频索引，用于「全局去重」。
+
+    键是 (归一化歌名, 归一化歌手)，同名同歌手再用时长区分。
+    只读标签、不改文件；扫描一次后常驻，本轮新下载的曲目会被追加进来，
+    所以同一轮里两个歌单含同一首歌也能挡住。
+    """
+
+    def __init__(self, root):
+        self.root = root
+        self.count = 0
+        self._map = {}
+        self._built = False
+
+    # ---------------------------------------------------------------- 构建
+    def build(self):
+        from mutagen import File as MutagenFile
+        self._map = {}
+        self.count = 0
+        self._built = True
+        if not self.root or not os.path.isdir(self.root):
+            return 0
+        for dirpath, _dirnames, filenames in os.walk(self.root):
+            for fn in filenames:
+                if not fn.lower().endswith(AUDIO_EXTS):
+                    continue
+                if self._add(os.path.join(dirpath, fn), MutagenFile):
+                    self.count += 1
+        return self.count
+
+    def add(self, path):
+        """下载完成后把新文件并进索引（没建过索引就什么都不做）。"""
+        if not self._built:
+            return False
+        try:
+            from mutagen import File as MutagenFile
+        except Exception:
+            return False
+        if self._add(path, MutagenFile):
+            self.count += 1
+            return True
+        return False
+
+    def _add(self, path, mutagen_file):
+        try:
+            audio = mutagen_file(path, easy=True)
+        except Exception:
+            return False
+        if audio is None:
+            return False
+        try:
+            title = (audio.get('title') or [''])[0]
+            artist = (audio.get('artist') or [''])[0]
+            length = int(round(float(audio.info.length or 0) * 1000))
+        except Exception:
+            return False
+        key = (normalize_key(title), normalize_key(artist))
+        if not key[0]:
+            return False
+        self._map.setdefault(key, []).append((path, length))
+        return True
+
+    # ---------------------------------------------------------------- 查询
+    def find(self, title, artist, duration_ms=0):
+        """返回音乐库中这首曲目的路径；没有则 None。"""
+        if not self._built:
+            return None
+        key = (normalize_key(title), normalize_key(artist))
+        for path, length in self._map.get(key, ()):
+            if duration_ms and length:
+                if abs(length - int(duration_ms)) > DURATION_TOLERANCE_MS:
+                    continue
+            return path
+        return None
 
 
 # --------------------------------------------------------------------------- #

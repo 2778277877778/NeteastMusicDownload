@@ -1,13 +1,16 @@
 @echo off
 chcp 65001 >nul
-rem 网易云音乐工具箱 - 免安装启动器（无控制台窗口）
+rem NeteastMusicDownload GUI launcher (no console window)
+rem This repo ships source only; python\ is a local venv, interpreter is python\Scripts\pythonw.exe
 cd /d "%~dp0"
-if not exist "python\pythonw.exe" (
-    echo [错误] 找不到内置运行时 python\pythonw.exe
-    echo 请确认整个文件夹被完整解压，不要只复制部分文件。
+if not exist "python\Scripts\pythonw.exe" (
+    echo [ERROR] runtime not found: python\Scripts\pythonw.exe
+    echo Create it first in this folder:
+    echo     python -m venv python
+    echo     python\Scripts\python.exe -m pip install requests mutagen pillow pycryptodomex tkinterdnd2
     echo.
     pause
     exit /b 1
 )
-start "" "python\pythonw.exe" "ncm_gui.py"
+start "" "python\Scripts\pythonw.exe" "ncm_gui.py"
 exit /b 0

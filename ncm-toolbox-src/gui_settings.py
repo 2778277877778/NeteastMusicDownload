@@ -109,6 +109,14 @@ class SettingsDialog(tk.Toplevel):
 
         r = ttk.Frame(d)
         r.pack(fill='x', padx=10, pady=(0, 4))
+        ttk.Label(r, text='', width=11).pack(side='left')
+        ttk.Checkbutton(r, text='在下载目录中全局去重',
+                        variable=self.dl.var_gdedupe).pack(side='left', padx=4)
+        ttk.Label(r, text='（下载前先在整个音乐库里找同一首歌，跨歌单也不重复下载）',
+                  foreground=C_MUTED).pack(side='left', padx=2)
+
+        r = ttk.Frame(d)
+        r.pack(fill='x', padx=10, pady=(0, 4))
         ttk.Label(r, text='请求间隔:', width=11).pack(side='left')
         self.var_interval = tk.DoubleVar(
             value=float(self.dl.settings.get('download_interval', 1.0) or 0))
@@ -223,8 +231,11 @@ class SettingsDialog(tk.Toplevel):
         except Exception:
             pass
         try:
-            self.dl.app.persist()
+            # 顺序很重要：collect() 只把 Tk 变量写回 settings（不落盘），
+            # persist() 才落盘。先 persist 后 collect 会把这次对话框里的
+            # 改动全部丢掉 —— 关掉对话框再打开，勾选状态又变回去了。
             self.dl.collect()
+            self.dl.app.persist()
             self.dl.app.sync_dir(self.dl.settings['download_dir'])
         except Exception:
             pass

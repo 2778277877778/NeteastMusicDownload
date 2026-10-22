@@ -81,11 +81,15 @@ def apply(root, style):
     style.map('TButton',
               background=[('disabled', WINDOW), ('pressed', SURFACE_HI), ('active', SURFACE_HI)],
               foreground=[('disabled', C_MUTED)])
-    style.configure('Primary.TButton', font=FONT_UI_BOLD, background=ACCENT,
-                    foreground=ACCENT_FG, padding=(12, 5))
+    # Vista 主题下 TButton 的背景是系统自绘的浅色面，style 里的 background
+    # 根本不生效（实测 background 查得到 ACCENT，画出来仍是白底）。所以这里
+    # 不能按「深底白字」配色 —— 那会变成白底白字，按钮文字整个看不见。
+    # 改用系统自绘底 + 强调色加粗文字，深浅两套主题下都清晰。
+    style.configure('Primary.TButton', font=FONT_UI_BOLD, padding=(12, 5),
+                    foreground=ACCENT)
     style.map('Primary.TButton',
               background=[('disabled', SURFACE), ('pressed', SURFACE_HI), ('active', SURFACE_HI)],
-              foreground=[('disabled', C_MUTED), ('!disabled', ACCENT_FG)])
+              foreground=[('disabled', C_MUTED), ('!disabled', ACCENT)])
 
     for cls in ('TEntry', 'TCombobox', 'TSpinbox'):
         style.configure(cls, fieldbackground=SURFACE, background=SURFACE, foreground=TEXT,

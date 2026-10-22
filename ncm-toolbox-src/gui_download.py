@@ -35,6 +35,7 @@ from gui_common import (
     IDLE_POLL_MS,
     KIND_LABEL,
     LEVEL_ORDER,
+    LibraryIndex,
     PLAY_FAIL_REASON,
     QUALITIES,
     StopRequested,
@@ -55,6 +56,7 @@ from gui_common import (
     parse_target,
     safe_name,
     search_songs,
+    song_duration_ms,
     song_meta,
     split_drop_paths,
     write_lrc_file,
@@ -76,6 +78,9 @@ class DownloadTab(ttk.Frame):
         self.tracks = []
         self._login_labels = []          # 所有用于显示登录状态的标签
         self._login = ('登录状态未知', C_MUTED)
+        # 全局去重用的音乐库索引：按需建立，换下载目录才重建
+        self._lib_index = None
+        self._lib_root = None
 
         self._build_ui()
         self.after(80, self._drain)
@@ -92,6 +97,7 @@ class DownloadTab(ttk.Frame):
         self.var_quality = tk.StringVar()
         self.var_cookie = tk.StringVar()
         self.var_skip = tk.BooleanVar(value=True)
+        self.var_gdedupe = tk.BooleanVar(value=False)
         self.var_lyrics = tk.BooleanVar(value=True)
         self.var_embed_lyrics = tk.BooleanVar(value=True)
         self.var_resume = tk.BooleanVar(value=True)
@@ -235,6 +241,7 @@ class DownloadTab(ttk.Frame):
             self.var_quality.set(QUALITIES[2][0])
         self.var_cookie.set(s.get('cookie', ''))
         self.var_skip.set(bool(s.get('skip_existing', True)))
+        self.var_gdedupe.set(bool(s.get('global_dedupe', False)))
         self.var_lyrics.set(bool(s.get('download_lyrics', True)))
         self.var_embed_lyrics.set(bool(s.get('embed_lyrics', True)))
         self.var_resume.set(bool(s.get('resume_partial', True)))
@@ -253,6 +260,7 @@ class DownloadTab(ttk.Frame):
             'quality': dict(QUALITIES)[self.var_quality.get()],
             'cookie': self.var_cookie.get().strip(),
             'skip_existing': bool(self.var_skip.get()),
+            'global_dedupe': bool(self.var_gdedupe.get()),
             'download_lyrics': bool(self.var_lyrics.get()),
             'embed_lyrics': bool(self.var_embed_lyrics.get()),
             'resume_partial': bool(self.var_resume.get()),
@@ -975,10 +983,33 @@ class DownloadTab(ttk.Frame):
                 return p
         return os.path.join(folder, '%s [%s-x]%s' % (base, song.get('id'), ext))
 
+    @staticmethod
+    def _rel_to(path, root):
+        try:
+            return os.path.relpath(path, root)
+        except ValueError:
+            return path
+
+    def _library_index(self, root):
+        """按需为整个下载目录建索引；一轮只建一次，换目录才重建。"""
+        if self._lib_index is not None and self._lib_root == root:
+            return self._lib_index
+        idx = LibraryIndex(root)
+        t0 = time.time()
+        self.q.put(('log', '正在扫描音乐库以建立去重索引…'))
+        n = idx.build()
+        self.q.put(('log', '索引完成：%d 个音频文件，用时 %.1fs' % (n, time.time() - t0)))
+        self._lib_index = idx
+        self._lib_root = root
+        return idx
+
     def _download_one(self, session, song, is_program, out_dir, idx, total, collection=None):
         s = self.settings
-        title, artist, album, track = song_meta(song, is_program)
-        title, artist, album = safe_name(title), safe_name(artist), safe_name(album)
+        raw_title, raw_artist, raw_album, raw_track = song_meta(song, is_program)
+        title = safe_name(raw_title)
+        artist = safe_name(raw_artist)
+        album = safe_name(raw_album)
+        track = raw_track
 
         audio_id = song['mainSong']['id'] if is_program else song['id']
 
@@ -991,6 +1022,16 @@ class DownloadTab(ttk.Frame):
             folder = os.path.join(out_dir, artist, album)
         else:
             folder = out_dir
+
+        # 全局去重：先在整个音乐库（不只是本源子目录）里找这首。
+        # 放在取播放地址之前 —— 命中就不必再请求接口，少一次风控风险。
+        if s.get('global_dedupe'):
+            hit = self._library_index(out_dir).find(
+                raw_title, raw_artist, song_duration_ms(song, is_program))
+            if hit:
+                self.q.put(('log', '  · 音乐库中已有，跳过：%s'
+                            % self._rel_to(hit, out_dir)))
+                return 'skip', '库中已有'
 
         level = s['quality']
         play, got_level, code = self._fetch_play_url(session, audio_id, level)
@@ -1059,7 +1100,6 @@ class DownloadTab(ttk.Frame):
             except Exception as e:
                 self.q.put(('log', '  · 歌词获取失败: %s' % e))
 
-        raw_title, raw_artist, raw_album, raw_track = song_meta(song, is_program)
         good, msg = write_tags(path, cover_path, raw_title, raw_artist, raw_album, raw_track,
                                lrc_text if s.get('embed_lyrics') else None)
         if not good:
@@ -1069,6 +1109,10 @@ class DownloadTab(ttk.Frame):
                 os.remove(cover_path)
             except OSError:
                 pass
+
+        # 本轮新下的曲目也要进索引，否则同一轮里第二个歌单含同一首歌时挡不住
+        if self._lib_index is not None:
+            self._lib_index.add(path)
 
         size = human_size(os.path.getsize(path))
         br = play.get('br')
