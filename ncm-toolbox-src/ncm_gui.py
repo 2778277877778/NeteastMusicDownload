@@ -34,6 +34,7 @@ from gui_common import (
     save_settings,
 )
 import gui_theme
+from gui_complete import CompleteTab
 from gui_decode import DecodeTab
 from gui_download import DownloadTab
 
@@ -56,8 +57,10 @@ class MainApp(object):
 
         self.nb = ttk.Notebook(root)
         self.download_tab = DownloadTab(self.nb, self)
+        self.complete_tab = CompleteTab(self.nb, self)
         self.decode_tab = DecodeTab(self.nb, self)
         self.nb.add(self.download_tab, text='   在线下载   ')
+        self.nb.add(self.complete_tab, text='   补完模式   ')
         self.nb.add(self.decode_tab, text='   NCM 解码   ')
 
         # 状态栏：设置都收进对话框了，关键状态就在这里一眼可见
@@ -77,6 +80,7 @@ class MainApp(object):
         self.nb.pack(fill='both', expand=True, padx=6, pady=(6, 0))
 
         self.download_tab.restore()
+        self.complete_tab.restore()
         self.decode_tab.restore()
         self.download_tab.register_login_label(self.lbl_login_bar)
         self._update_status()
@@ -108,7 +112,8 @@ class MainApp(object):
             pass
         # 和两个标签页同一套策略：有活干 60ms，空闲 400ms。
         # 原来固定 200ms，窗口开着什么都不干也在每秒醒 5 次。
-        busy = got or self.download_tab.busy or self.decode_tab.busy
+        busy = (got or self.download_tab.busy or self.decode_tab.busy
+                or self.complete_tab.busy)
         self.root.after(BUSY_POLL_MS if busy else IDLE_POLL_MS, self._drain_app)
 
     # ------------------------------------------------------------- 自动登录
@@ -232,9 +237,16 @@ class MainApp(object):
         self.decode_tab.set_dir(cur)
         self._update_status()
 
-    def select_tab(self, index):
+    def select_tab(self, which):
+        """切到某个页签。支持数字索引，也支持页签名（'download'/'complete'/'decode'）。
+
+        名字形式是给跨页跳转用的 —— 「补完模式」把曲目交给下载页后要跳过去，
+        写死索引的话，以后页签顺序一改就跳错地方。
+        """
+        if isinstance(which, str):
+            which = {'download': 0, 'complete': 1, 'decode': 2}.get(which, 0)
         try:
-            self.nb.select(index)
+            self.nb.select(which)
         except Exception:
             pass
 

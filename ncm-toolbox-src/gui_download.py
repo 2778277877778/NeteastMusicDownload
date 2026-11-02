@@ -349,6 +349,46 @@ class DownloadTab(ttk.Frame):
         self.lbl_all.configure(text='0 / 0')
         self.lbl_one.configure(text='')
 
+    # ------------------------------------------------------- 外部并入队列
+    def enqueue_tracks(self, tracks):
+        """把外部解析好的曲目（如「补完模式」）并进当前队列，返回新增条数。
+
+        只追加、不覆盖：用户可能已经粘了一批链接解析好还没开始下，
+        把那个列表清掉就等于丢了他的工作。完全相同的曲目（同一个 song id、
+        同样的 is_program）重复并入时直接跳过，否则同一个目标点两次就会下一遍。
+        """
+        if not tracks:
+            return 0
+        seen = set()
+        for t in self.tracks:
+            sid = t.get('song', {}).get('id')
+            if sid is not None:
+                seen.add((sid, bool(t.get('is_program'))))
+        added = 0
+        for t in tracks:
+            sid = t.get('song', {}).get('id')
+            if sid is not None:
+                key = (sid, bool(t.get('is_program')))
+                if key in seen:
+                    continue
+                seen.add(key)
+            t.setdefault('failed', False)
+            self.tracks.append(t)
+            added += 1
+        if not added:
+            return 0
+
+        # 只把新增的行追加到末尾，不重建整个列表：已有的行带着上一轮的状态，
+        # 重建会把它们全部抹成「等待」。
+        base = len(self.tracks) - added
+        for i in range(base, len(self.tracks)):
+            tr = self.tracks[i]
+            t, a, al, _ = song_meta(tr['song'], tr['is_program'])
+            self.tree.insert('', 'end', iid=str(i), values=(
+                i + 1, t, a, al, tr.get('source') or '补完', '等待'))
+        self.lbl_all.configure(text='0 / %d' % len(self.tracks))
+        return added
+
     def clear_all(self):
         self.txt_input.delete('1.0', 'end')
         self._refresh_placeholder()

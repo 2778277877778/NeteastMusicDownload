@@ -142,6 +142,12 @@ DEFAULT_SETTINGS = {
     'download_interval': 1.0,    # 每首之间的间隔（秒）
                                  # 批量下载时短时间高频请求是风控最敏感的模式，
                                  # 默认留 1 秒缓冲，别把它调成 0 去跑几百首。
+    # 补完模式（拿音乐库当线索反查远端，见 gui_complete.py）
+    'complete_mode': 'album',    # 'album' 按专辑补 / 'artist' 按歌手补
+    'complete_interval': 0.5,    # 解析每个目标之间的间隔（秒）
+                                 # 一个几千首的库能牵出上千个目标，解析就是上千次
+                                 # 搜索请求 —— 这是风控最容易盯上的形态，别调成 0。
+
     # NCM 解码（内置解密，只解容器不转码）
     'decode_concurrency': 4,
     'decode_cover': True,
